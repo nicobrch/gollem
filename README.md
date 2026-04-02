@@ -2,7 +2,7 @@
 
 Minimal, fast Go AI gateway.
 
-This first version is intentionally simple:
+This version supports:
 
 - OpenAI-compatible endpoints:
   - `POST /v1/chat/completions`
@@ -10,15 +10,18 @@ This first version is intentionally simple:
 - Azure-compatible endpoint:
   - `POST /openai/deployments/{deployment}/chat/completions` (optional `api-version` query is accepted and ignored by the gateway)
 - OpenAI-compatible Chat Completions request format
-- Gateway API key auth for your clients
+- Gateway-issued API key auth for your clients
+- Admin key management endpoints backed by JSON file persistence
 - Forwards to Azure AI Foundry (Azure OpenAI) chat completions deployment endpoint
+- Live request/response logging in terminal with redaction-safe summaries
 
 ## Quick start
 
 1. Set env vars:
 
 ```bash
-export GATEWAY_API_KEY="gw-dev-key"
+export GATEWAY_ADMIN_API_KEY="gw-admin-dev-key"
+export GATEWAY_KEYS_FILE="./data/gateway_keys.json"
 export AZURE_OPENAI_API_KEY="..."
 export AZURE_OPENAI_BASE_URL="https://<your-account>.openai.azure.com"
 export AZURE_OPENAI_DEPLOYMENT="gpt4o"
@@ -31,11 +34,26 @@ export PORT="8000"
 go run .
 ```
 
-3. Call the gateway:
+3. Create a gateway API key (one-time return of plaintext key):
+
+```bash
+curl -sS http://localhost:8000/admin/keys \
+  -H "Authorization: Bearer gw-admin-dev-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metadata": {
+      "email": "dev@example.com",
+      "user_id": "u-123",
+      "name": "Dev User"
+    }
+  }'
+```
+
+4. Call the gateway with the issued key:
 
 ```bash
 curl -sS http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer gw-dev-key" \
+  -H "Authorization: Bearer <issued-gateway-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt4o",
@@ -47,7 +65,9 @@ curl -sS http://localhost:8000/v1/chat/completions \
 
 ## Config
 
-- `GATEWAY_API_KEY` (required): key your clients must send.
+- `GATEWAY_ADMIN_API_KEY` (required unless `GATEWAY_API_KEY` is set): admin key for key management endpoints.
+- `GATEWAY_KEYS_FILE` (optional, default `./data/gateway_keys.json`): JSON persistence file for issued gateway keys.
+- `GATEWAY_API_KEY` (optional): legacy static client key fallback. This is supported for migration, but managed keys are recommended.
 - `AZURE_OPENAI_API_KEY` (required): Azure OpenAI key.
 - `AZURE_OPENAI_BASE_URL` (required): Foundry endpoint base URL, e.g. `https://<account>.openai.azure.com`.
 - `AZURE_OPENAI_DEPLOYMENT` (required): deployment name created in Azure Foundry (for this repo, from Terraform output `openai_deployment_name`, default `gpt4o`).
@@ -64,9 +84,51 @@ Compatibility fallbacks:
 - If `AZURE_OPENAI_API_KEY` is missing, `OPENAI_API_KEY` is accepted as a fallback.
 - If `AZURE_OPENAI_BASE_URL` is missing, `OPENAI_BASE_URL` is accepted as a fallback.
 
+## Key management API
+
+- `POST /admin/keys`: create key. Returns plaintext key once, plus metadata and key id.
+- `GET /admin/keys`: list key records.
+- `GET /admin/keys/{id}`: lookup key metadata/status.
+- `POST /admin/keys/{id}/revoke`: revoke key.
+
+All `/admin/*` endpoints require:
+
+- `Authorization: Bearer <GATEWAY_ADMIN_API_KEY>` or `X-API-Key: <GATEWAY_ADMIN_API_KEY>`
+
+Stored key record fields include:
+
+- `id`
+- `key_prefix`
+- `key_hash` (stored in JSON, not returned as plaintext key)
+- `created_at`
+- `expires_at` (optional)
+- `status` (`active` or `revoked`)
+- `metadata` (e.g. `email`, `user_id`, `name`, custom labels)
+
 ## Notes
 
-- Auth supports `Authorization: Bearer <GATEWAY_API_KEY>` and `X-API-Key`.
+- Client auth supports `Authorization: Bearer <gateway-key>` and `X-API-Key`.
+- Gateway validates managed keys by hash, checks `status`, and enforces optional `expires_at`.
 - If `model` is missing and you call `/openai/deployments/{deployment}/chat/completions`, the gateway uses `{deployment}` as `model`.
 - `/healthz` is available for health checks.
 - Streaming responses are forwarded to the client.
+
+## Live logging
+
+For chat requests, terminal logs include request and response summaries with:
+
+- timestamp
+- request id
+- key id and owner hint from metadata (if available)
+- route, provider, and model
+- request prompt summary
+- response summary
+- status code and latency
+
+Sensitive values like API keys and auth headers are not logged.
+
+## Security
+
+- Keep `.env` out of source control (already ignored).
+- Never commit real keys in docs/examples.
+- Rotate any key immediately if it is ever exposed.

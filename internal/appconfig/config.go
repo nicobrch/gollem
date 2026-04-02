@@ -16,17 +16,20 @@ const (
 	defaultAzureAPIVersion      = "2024-10-21"
 	defaultRequestTimeout       = 60 * time.Second
 	defaultMaxBodyBytes         = int64(1 << 20) // 1 MiB
+	defaultGatewayKeysFile      = "./data/gateway_keys.json"
 	defaultAzureCompletionsPath = "/openai/deployments/%s/chat/completions"
 )
 
 type Config struct {
-	ListenAddr     string
-	GatewayAPIKey  string
-	ProviderName   string
-	DefaultModel   string
-	RequestTimeout time.Duration
-	MaxBodyBytes   int64
-	Azure          AzureConfig
+	ListenAddr      string
+	GatewayAPIKey   string
+	GatewayAdminKey string
+	GatewayKeysFile string
+	ProviderName    string
+	DefaultModel    string
+	RequestTimeout  time.Duration
+	MaxBodyBytes    int64
+	Azure           AzureConfig
 }
 
 type AzureConfig struct {
@@ -44,8 +47,17 @@ func Load() (Config, error) {
 	listenAddr := envOrDefault("LISTEN_ADDR", ":"+port)
 
 	gatewayAPIKey := strings.TrimSpace(os.Getenv("GATEWAY_API_KEY"))
-	if gatewayAPIKey == "" {
-		return Config{}, fmt.Errorf("GATEWAY_API_KEY is required")
+	gatewayAdminKey := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_API_KEY"))
+	if gatewayAdminKey == "" {
+		gatewayAdminKey = gatewayAPIKey
+	}
+	if gatewayAdminKey == "" {
+		return Config{}, fmt.Errorf("GATEWAY_ADMIN_API_KEY is required (or GATEWAY_API_KEY fallback)")
+	}
+
+	gatewayKeysFile := strings.TrimSpace(envOrDefault("GATEWAY_KEYS_FILE", defaultGatewayKeysFile))
+	if gatewayKeysFile == "" {
+		return Config{}, fmt.Errorf("GATEWAY_KEYS_FILE cannot be empty")
 	}
 
 	providerName := strings.ToLower(envOrDefault("LLM_PROVIDER", defaultProvider))
@@ -82,13 +94,15 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		ListenAddr:     listenAddr,
-		GatewayAPIKey:  gatewayAPIKey,
-		ProviderName:   providerName,
-		DefaultModel:   defaultModel,
-		RequestTimeout: requestTimeout,
-		MaxBodyBytes:   maxBodyBytes,
-		Azure:          azureCfg,
+		ListenAddr:      listenAddr,
+		GatewayAPIKey:   gatewayAPIKey,
+		GatewayAdminKey: gatewayAdminKey,
+		GatewayKeysFile: gatewayKeysFile,
+		ProviderName:    providerName,
+		DefaultModel:    defaultModel,
+		RequestTimeout:  requestTimeout,
+		MaxBodyBytes:    maxBodyBytes,
+		Azure:           azureCfg,
 	}, nil
 }
 

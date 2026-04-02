@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +11,11 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
+	"go-llm/internal/gatewaykeys"
 	"go-llm/internal/providers"
 )
 
@@ -23,6 +28,7 @@ const (
 
 type Config struct {
 	GatewayAPIKey string
+	AdminAPIKey   string
 	DefaultModel  string
 	MaxBodyBytes  int64
 }
@@ -30,13 +36,15 @@ type Config struct {
 type Gateway struct {
 	client   *http.Client
 	provider providers.ChatProvider
+	keys     *gatewaykeys.Manager
 	cfg      Config
 }
 
-func New(client *http.Client, provider providers.ChatProvider, cfg Config) *Gateway {
+func New(client *http.Client, provider providers.ChatProvider, keyManager *gatewaykeys.Manager, cfg Config) *Gateway {
 	return &Gateway{
 		client:   client,
 		provider: provider,
+		keys:     keyManager,
 		cfg:      cfg,
 	}
 }
@@ -44,6 +52,8 @@ func New(client *http.Client, provider providers.ChatProvider, cfg Config) *Gate
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", g.healthzHandler)
+	mux.HandleFunc("/admin/keys", g.adminKeysHandler)
+	mux.HandleFunc("/admin/keys/", g.adminKeyByIDHandler)
 	mux.HandleFunc("/chat/completions", g.chatCompletionsHandler(""))
 	mux.HandleFunc("/v1/chat/completions", g.chatCompletionsHandler(""))
 	mux.HandleFunc(azureChatCompletionsPathPrefix, g.azureChatCompletionsHandler)
@@ -76,12 +86,24 @@ func (g *Gateway) azureChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, deploymentHint string) {
+	start := time.Now()
+	requestID := requestIDFor(r)
+	w.Header().Set("X-Request-Id", requestID)
+
 	if r.Method != http.MethodPost {
+		log.Printf("gateway request_id=%s route=%s key_id=unknown status=%d latency_ms=%d error=%q", requestID, r.URL.Path, http.StatusMethodNotAllowed, elapsedMillis(start), "method not allowed")
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "method_not_allowed")
 		return
 	}
 
-	if !g.isAuthorized(r) {
+	principal, ok, err := g.authenticateRequest(r)
+	if err != nil {
+		log.Printf("gateway request_id=%s route=%s key_id=unknown status=%d latency_ms=%d error=%q", requestID, r.URL.Path, http.StatusInternalServerError, elapsedMillis(start), "auth backend unavailable")
+		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "gateway_internal_error")
+		return
+	}
+	if !ok {
+		log.Printf("gateway request_id=%s route=%s key_id=unknown status=%d latency_ms=%d error=%q", requestID, r.URL.Path, http.StatusUnauthorized, elapsedMillis(start), "invalid gateway API key")
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid gateway API key", "invalid_api_key")
 		return
 	}
@@ -94,25 +116,32 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 			status = http.StatusRequestEntityTooLarge
 			code = "payload_too_large"
 		}
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s status=%d latency_ms=%d error=%q", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), status, elapsedMillis(start), err.Error())
 		writeOpenAIError(w, status, err.Error(), code)
 		return
 	}
 
 	normalizedBody, err := normalizeChatCompletionRequest(body, g.cfg.DefaultModel, deploymentHint)
 	if err != nil {
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s status=%d latency_ms=%d error=%q", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), http.StatusBadRequest, elapsedMillis(start), err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 
+	requestSummary, targetModel := summarizeRequestPayload(normalizedBody)
+
 	acceptHeader := strings.TrimSpace(r.Header.Get("Accept"))
 	proxyReq, err := g.provider.NewChatCompletionsRequest(r.Context(), normalizedBody, acceptHeader, defaultUserAgent)
 	if err != nil {
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q status=%d latency_ms=%d error=%q", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, http.StatusInternalServerError, elapsedMillis(start), "failed to create upstream request")
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to create upstream request", "gateway_internal_error")
 		return
 	}
+	proxyReq.Header.Set("X-Request-Id", requestID)
 
 	resp, err := g.client.Do(proxyReq)
 	if err != nil {
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q status=%d latency_ms=%d error=%q upstream_err=%q", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, http.StatusBadGateway, elapsedMillis(start), "upstream request failed", err.Error())
 		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed", "upstream_unavailable")
 		return
 	}
@@ -121,9 +150,13 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	if err := streamCopy(w, resp.Body); err != nil {
+	responseCapture := newLimitedBuffer(2048)
+	if err := streamCopy(w, io.TeeReader(resp.Body, responseCapture)); err != nil {
 		log.Printf("response streaming failed: %v", err)
 	}
+
+	responseSummary := summarizeResponsePayload(responseCapture.Bytes())
+	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, resp.StatusCode, elapsedMillis(start))
 }
 
 func deploymentNameFromPath(requestPath string) (string, bool) {
@@ -152,9 +185,27 @@ func deploymentNameFromPath(requestPath string) (string, bool) {
 	return deploymentName, true
 }
 
-func (g *Gateway) isAuthorized(r *http.Request) bool {
+func (g *Gateway) authenticateRequest(r *http.Request) (gatewaykeys.Principal, bool, error) {
 	token := extractAPIToken(r)
-	return token != "" && token == g.cfg.GatewayAPIKey
+	if token == "" {
+		return gatewaykeys.Principal{}, false, nil
+	}
+
+	if g.keys != nil {
+		principal, ok, err := g.keys.Authenticate(token)
+		if err != nil {
+			return gatewaykeys.Principal{}, false, err
+		}
+		if ok {
+			return principal, true, nil
+		}
+	}
+
+	if g.cfg.GatewayAPIKey != "" && subtle.ConstantTimeCompare([]byte(token), []byte(g.cfg.GatewayAPIKey)) == 1 {
+		return gatewaykeys.Principal{KeyID: "legacy", Metadata: map[string]string{}}, true, nil
+	}
+
+	return gatewaykeys.Principal{}, false, nil
 }
 
 func extractAPIToken(r *http.Request) string {
@@ -166,6 +217,357 @@ func extractAPIToken(r *http.Request) string {
 		}
 	}
 	return strings.TrimSpace(r.Header.Get("X-API-Key"))
+}
+
+func (g *Gateway) adminKeysHandler(w http.ResponseWriter, r *http.Request) {
+	if !g.isAdminAuthorized(r) {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid admin API key", "invalid_admin_api_key")
+		return
+	}
+	if g.keys == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "key manager not configured", "key_manager_unavailable")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		g.createKeyHandler(w, r)
+	case http.MethodGet:
+		g.listKeysHandler(w)
+	default:
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "method_not_allowed")
+	}
+}
+
+func (g *Gateway) adminKeyByIDHandler(w http.ResponseWriter, r *http.Request) {
+	if !g.isAdminAuthorized(r) {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid admin API key", "invalid_admin_api_key")
+		return
+	}
+	if g.keys == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "key manager not configured", "key_manager_unavailable")
+		return
+	}
+
+	keyID, action := parseAdminKeyPath(r.URL.Path)
+	if keyID == "" {
+		writeOpenAIError(w, http.StatusNotFound, "unsupported path", "not_found")
+		return
+	}
+
+	if r.Method == http.MethodGet && action == "" {
+		g.getKeyHandler(w, keyID)
+		return
+	}
+	if r.Method == http.MethodPost && action == "revoke" {
+		g.revokeKeyHandler(w, keyID)
+		return
+	}
+
+	writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "method_not_allowed")
+}
+
+type createKeyRequest struct {
+	ExpiresAt *time.Time        `json:"expires_at"`
+	Metadata  map[string]string `json:"metadata"`
+}
+
+type keyResponse struct {
+	ID        string            `json:"id"`
+	KeyPrefix string            `json:"key_prefix"`
+	CreatedAt time.Time         `json:"created_at"`
+	ExpiresAt *time.Time        `json:"expires_at,omitempty"`
+	Status    string            `json:"status"`
+	Metadata  map[string]string `json:"metadata"`
+}
+
+type keyCreateResponse struct {
+	Key string `json:"key"`
+	keyResponse
+}
+
+func (g *Gateway) createKeyHandler(w http.ResponseWriter, r *http.Request) {
+	var req createKeyRequest
+	if r.Body != nil {
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error")
+			return
+		}
+	}
+
+	record, plain, err := g.keys.Create(gatewaykeys.CreateInput{ExpiresAt: req.ExpiresAt, Metadata: req.Metadata})
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, keyCreateResponse{
+		Key:         plain,
+		keyResponse: toKeyResponse(record),
+	})
+}
+
+func (g *Gateway) listKeysHandler(w http.ResponseWriter) {
+	records, err := g.keys.List()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed listing keys", "gateway_internal_error")
+		return
+	}
+
+	items := make([]keyResponse, 0, len(records))
+	for _, record := range records {
+		items = append(items, toKeyResponse(record))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"keys": items})
+}
+
+func (g *Gateway) getKeyHandler(w http.ResponseWriter, keyID string) {
+	record, err := g.keys.GetByID(keyID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "gateway_internal_error"
+		message := "failed loading key"
+		if errors.Is(err, gatewaykeys.ErrKeyNotFound) {
+			status = http.StatusNotFound
+			code = "not_found"
+			message = "key not found"
+		}
+		writeOpenAIError(w, status, message, code)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toKeyResponse(record))
+}
+
+func (g *Gateway) revokeKeyHandler(w http.ResponseWriter, keyID string) {
+	record, err := g.keys.Revoke(keyID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "gateway_internal_error"
+		message := "failed revoking key"
+		if errors.Is(err, gatewaykeys.ErrKeyNotFound) {
+			status = http.StatusNotFound
+			code = "not_found"
+			message = "key not found"
+		}
+		writeOpenAIError(w, status, message, code)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toKeyResponse(record))
+}
+
+func (g *Gateway) isAdminAuthorized(r *http.Request) bool {
+	if g.cfg.AdminAPIKey == "" {
+		return false
+	}
+	token := extractAPIToken(r)
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(g.cfg.AdminAPIKey)) == 1
+}
+
+func parseAdminKeyPath(path string) (string, string) {
+	trimmed := strings.Trim(path, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) < 3 || parts[0] != "admin" || parts[1] != "keys" {
+		return "", ""
+	}
+	if parts[2] == "" {
+		return "", ""
+	}
+	if len(parts) == 3 {
+		return parts[2], ""
+	}
+	if len(parts) == 4 {
+		return parts[2], parts[3]
+	}
+	return "", ""
+}
+
+func toKeyResponse(record gatewaykeys.Record) keyResponse {
+	return keyResponse{
+		ID:        record.ID,
+		KeyPrefix: record.KeyPrefix,
+		CreatedAt: record.CreatedAt,
+		ExpiresAt: record.ExpiresAt,
+		Status:    record.Status,
+		Metadata:  record.Metadata,
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func requestIDFor(r *http.Request) string {
+	if requestID := strings.TrimSpace(r.Header.Get("X-Request-Id")); requestID != "" {
+		if len(requestID) > 128 {
+			return requestID[:128]
+		}
+		return requestID
+	}
+
+	b := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, b); err == nil {
+		return hexEncode(b)
+	}
+
+	return "req-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+func ownerHint(metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return "unknown"
+	}
+	for _, key := range []string{"email", "user_id", "name"} {
+		if value := strings.TrimSpace(metadata[key]); value != "" {
+			return value
+		}
+	}
+	return "custom"
+}
+
+func summarizeRequestPayload(body []byte) (string, string) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return truncateForLog(string(body), 180), ""
+	}
+
+	model := strings.TrimSpace(fmt.Sprint(payload["model"]))
+	if model == "<nil>" {
+		model = ""
+	}
+
+	messagesAny, _ := payload["messages"].([]any)
+	messageCount := len(messagesAny)
+	promptPreview := ""
+	for i := len(messagesAny) - 1; i >= 0; i-- {
+		messageMap, ok := messagesAny[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.TrimSpace(fmt.Sprint(messageMap["role"]))
+		if role != "user" {
+			continue
+		}
+		promptPreview = extractMessageContent(messageMap["content"])
+		break
+	}
+
+	summary := fmt.Sprintf("messages=%d prompt=%q", messageCount, truncateForLog(promptPreview, 180))
+	return summary, model
+}
+
+func summarizeResponsePayload(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return ""
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return truncateForLog(string(trimmed), 180)
+	}
+
+	choicesAny, _ := payload["choices"].([]any)
+	if len(choicesAny) > 0 {
+		if firstChoice, ok := choicesAny[0].(map[string]any); ok {
+			if message, ok := firstChoice["message"].(map[string]any); ok {
+				content := extractMessageContent(message["content"])
+				if content != "" {
+					return truncateForLog(content, 180)
+				}
+			}
+		}
+	}
+
+	if errValue, ok := payload["error"]; ok {
+		return truncateForLog(fmt.Sprint(errValue), 180)
+	}
+
+	return truncateForLog(string(trimmed), 180)
+}
+
+func extractMessageContent(content any) string {
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			if itemMap, ok := item.(map[string]any); ok {
+				text := strings.TrimSpace(fmt.Sprint(itemMap["text"]))
+				if text != "" && text != "<nil>" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return strings.TrimSpace(fmt.Sprint(content))
+	}
+}
+
+func truncateForLog(value string, max int) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) <= max {
+		return trimmed
+	}
+	if max <= 3 {
+		return trimmed[:max]
+	}
+	return trimmed[:max-3] + "..."
+}
+
+func elapsedMillis(start time.Time) int64 {
+	return time.Since(start).Milliseconds()
+}
+
+type limitedBuffer struct {
+	max int
+	buf bytes.Buffer
+}
+
+func newLimitedBuffer(max int) *limitedBuffer {
+	return &limitedBuffer{max: max}
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	originalLen := len(p)
+	if b.max <= 0 {
+		return originalLen, nil
+	}
+
+	remaining := b.max - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		_, _ = b.buf.Write(p)
+	}
+
+	return originalLen, nil
+}
+
+func (b *limitedBuffer) Bytes() []byte {
+	return b.buf.Bytes()
+}
+
+func hexEncode(b []byte) string {
+	const hextable = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = hextable[v>>4]
+		out[i*2+1] = hextable[v&0x0f]
+	}
+	return string(out)
 }
 
 var errBodyTooLarge = errors.New("request body exceeds MAX_BODY_BYTES")

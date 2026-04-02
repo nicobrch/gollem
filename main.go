@@ -3,10 +3,12 @@ package main
 import (
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go-llm/internal/appconfig"
 	"go-llm/internal/gateway"
+	"go-llm/internal/gatewaykeys"
 	"go-llm/internal/httpclient"
 	"go-llm/internal/providers"
 )
@@ -22,8 +24,12 @@ func main() {
 		log.Fatalf("provider error: %v", err)
 	}
 
-	g := gateway.New(httpclient.New(cfg.RequestTimeout), provider, gateway.Config{
+	keyStore := gatewaykeys.NewFileStore(cfg.GatewayKeysFile)
+	keyManager := gatewaykeys.NewManager(keyStore)
+
+	g := gateway.New(httpclient.New(cfg.RequestTimeout), provider, keyManager, gateway.Config{
 		GatewayAPIKey: cfg.GatewayAPIKey,
+		AdminAPIKey:   cfg.GatewayAdminKey,
 		DefaultModel:  cfg.DefaultModel,
 		MaxBodyBytes:  cfg.MaxBodyBytes,
 	})
@@ -39,8 +45,13 @@ func main() {
 
 	log.Printf("go-llm listening on %s", cfg.ListenAddr)
 	log.Printf("provider: %s", provider.Name())
+	log.Printf("gateway keys file: %s", cfg.GatewayKeysFile)
 	if cfg.ProviderName == "azure" {
-		log.Printf("azure upstream: %s", cfg.Azure.UpstreamURL)
+		azureHost := cfg.Azure.UpstreamURL
+		if parsedURL, parseErr := url.Parse(cfg.Azure.UpstreamURL); parseErr == nil && parsedURL.Host != "" {
+			azureHost = parsedURL.Host
+		}
+		log.Printf("azure upstream host: %s", azureHost)
 	}
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

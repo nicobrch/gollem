@@ -12,6 +12,9 @@ go-llm
 *.out
 coverage.*
 
+# Temporary gateway keys file
+data/gateway_keys.json
+
 # Editor and OS files
 .DS_Store
 .vscode/
