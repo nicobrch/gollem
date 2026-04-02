@@ -4,7 +4,11 @@ Minimal, fast Go AI gateway.
 
 This first version is intentionally simple:
 
-- One endpoint: `POST /llm`
+- OpenAI-compatible endpoints:
+  - `POST /v1/chat/completions`
+  - `POST /chat/completions`
+- Azure-compatible endpoint:
+  - `POST /openai/deployments/{deployment}/chat/completions` (optional `api-version` query is accepted and ignored by the gateway)
 - OpenAI-compatible Chat Completions request format
 - Gateway API key auth for your clients
 - Forwards to Azure AI Foundry (Azure OpenAI) chat completions deployment endpoint
@@ -30,7 +34,7 @@ go run .
 3. Call the gateway:
 
 ```bash
-curl -sS http://localhost:8000/llm \
+curl -sS http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer gw-dev-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -63,5 +67,6 @@ Compatibility fallbacks:
 ## Notes
 
 - Auth supports `Authorization: Bearer <GATEWAY_API_KEY>` and `X-API-Key`.
+- If `model` is missing and you call `/openai/deployments/{deployment}/chat/completions`, the gateway uses `{deployment}` as `model`.
 - `/healthz` is available for health checks.
 - Streaming responses are forwarded to the client.
