@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+
+# Go build artifacts
+go-llm
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
