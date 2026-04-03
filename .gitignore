@@ -3,7 +3,7 @@
 !.env.example
 
 # Go build artifacts
-go-llm
+gollem
 *.exe
 *.dll
 *.so
@@ -11,6 +11,18 @@ go-llm
 *.test
 *.out
 coverage.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
 
 # Temporary gateway keys file
 data/gateway_keys.json
