@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"go-llm/internal/appconfig"
-	"go-llm/internal/providers/azure"
+	"gollem/internal/appconfig"
+	"gollem/internal/providers/azure"
 )
 
 type ChatProvider interface {

@@ -6,11 +6,11 @@ import (
 	"net/url"
 	"time"
 
-	"go-llm/internal/appconfig"
-	"go-llm/internal/gateway"
-	"go-llm/internal/gatewaykeys"
-	"go-llm/internal/httpclient"
-	"go-llm/internal/providers"
+	"gollem/internal/appconfig"
+	"gollem/internal/gateway"
+	"gollem/internal/gatewaykeys"
+	"gollem/internal/httpclient"
+	"gollem/internal/providers"
 )
 
 func main() {
@@ -32,6 +32,7 @@ func main() {
 		AdminAPIKey:   cfg.GatewayAdminKey,
 		DefaultModel:  cfg.DefaultModel,
 		MaxBodyBytes:  cfg.MaxBodyBytes,
+		MaxInFlight:   cfg.MaxInFlight,
 	})
 
 	server := &http.Server{
@@ -43,7 +44,7 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	log.Printf("go-llm listening on %s", cfg.ListenAddr)
+	log.Printf("gollem listening on %s", cfg.ListenAddr)
 	log.Printf("provider: %s", provider.Name())
 	log.Printf("gateway keys file: %s", cfg.GatewayKeysFile)
 	if cfg.ProviderName == "azure" {

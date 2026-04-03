@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"go-llm/internal/gatewaykeys"
+	"gollem/internal/gatewaykeys"
 )
 
 type stubProvider struct {
@@ -254,5 +254,55 @@ func TestAdminEndpoints_KeyLifecycle(t *testing.T) {
 	g.Handler().ServeHTTP(revokeRR, revokeReq)
 	if revokeRR.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, revokeRR.Code)
+	}
+}
+
+func TestHandler_MaxInFlightRejectsExcessRequests(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, nil, Config{
+		GatewayAPIKey: "gw-key",
+		DefaultModel:  "fallback-model",
+		MaxBodyBytes:  4096,
+		MaxInFlight:   1,
+	})
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"first"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer gw-key")
+	firstReq.Header.Set("Content-Type", "application/json")
+
+	firstCode := make(chan int, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		g.Handler().ServeHTTP(rr, firstReq)
+		firstCode <- rr.Code
+	}()
+
+	<-entered
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"second"}]}`))
+	secondReq.Header.Set("Authorization", "Bearer gw-key")
+	secondReq.Header.Set("Content-Type", "application/json")
+
+	secondRR := httptest.NewRecorder()
+	g.Handler().ServeHTTP(secondRR, secondReq)
+
+	if secondRR.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected status %d, got %d", http.StatusTooManyRequests, secondRR.Code)
+	}
+
+	close(release)
+
+	if got := <-firstCode; got != http.StatusOK {
+		t.Fatalf("expected first request status %d, got %d", http.StatusOK, got)
 	}
 }

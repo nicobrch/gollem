@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"go-llm/internal/appconfig"
+	"gollem/internal/appconfig"
 )
 
 type Provider struct {

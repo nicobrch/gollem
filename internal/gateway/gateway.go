@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"go-llm/internal/gatewaykeys"
-	"go-llm/internal/providers"
+	"gollem/internal/gatewaykeys"
+	"gollem/internal/providers"
 )
 
-const defaultUserAgent = "go-llm/0.1"
+const defaultUserAgent = "gollem/0.1"
 
 const (
 	azureChatCompletionsPathPrefix = "/openai/deployments/"
@@ -31,6 +31,7 @@ type Config struct {
 	AdminAPIKey   string
 	DefaultModel  string
 	MaxBodyBytes  int64
+	MaxInFlight   int
 }
 
 type Gateway struct {
@@ -38,14 +39,21 @@ type Gateway struct {
 	provider providers.ChatProvider
 	keys     *gatewaykeys.Manager
 	cfg      Config
+	inflight chan struct{}
 }
 
 func New(client *http.Client, provider providers.ChatProvider, keyManager *gatewaykeys.Manager, cfg Config) *Gateway {
+	var inflight chan struct{}
+	if cfg.MaxInFlight > 0 {
+		inflight = make(chan struct{}, cfg.MaxInFlight)
+	}
+
 	return &Gateway{
 		client:   client,
 		provider: provider,
 		keys:     keyManager,
 		cfg:      cfg,
+		inflight: inflight,
 	}
 }
 
@@ -95,6 +103,15 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "method_not_allowed")
 		return
 	}
+
+	releaseSlot, acquired := g.tryAcquireInFlightSlot()
+	if !acquired {
+		w.Header().Set("Retry-After", "1")
+		log.Printf("gateway request_id=%s route=%s key_id=unknown status=%d latency_ms=%d error=%q", requestID, r.URL.Path, http.StatusTooManyRequests, elapsedMillis(start), "max inflight requests exceeded")
+		writeOpenAIError(w, http.StatusTooManyRequests, "gateway overloaded, retry later", "rate_limit_exceeded")
+		return
+	}
+	defer releaseSlot()
 
 	principal, ok, err := g.authenticateRequest(r)
 	if err != nil {
@@ -157,6 +174,21 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 
 	responseSummary := summarizeResponsePayload(responseCapture.Bytes())
 	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, resp.StatusCode, elapsedMillis(start))
+}
+
+func (g *Gateway) tryAcquireInFlightSlot() (func(), bool) {
+	if g.inflight == nil {
+		return func() {}, true
+	}
+
+	select {
+	case g.inflight <- struct{}{}:
+		return func() {
+			<-g.inflight
+		}, true
+	default:
+		return nil, false
+	}
 }
 
 func deploymentNameFromPath(requestPath string) (string, bool) {

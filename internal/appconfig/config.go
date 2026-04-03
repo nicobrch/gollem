@@ -29,6 +29,7 @@ type Config struct {
 	DefaultModel    string
 	RequestTimeout  time.Duration
 	MaxBodyBytes    int64
+	MaxInFlight     int
 	Azure           AzureConfig
 }
 
@@ -83,6 +84,15 @@ func Load() (Config, error) {
 		maxBodyBytes = size
 	}
 
+	maxInFlight := 0
+	if v := strings.TrimSpace(os.Getenv("MAX_INFLIGHT_REQUESTS")); v != "" {
+		limit, err := strconv.Atoi(v)
+		if err != nil || limit < 0 {
+			return Config{}, fmt.Errorf("MAX_INFLIGHT_REQUESTS must be a non-negative integer")
+		}
+		maxInFlight = limit
+	}
+
 	azureCfg, err := loadAzureConfig()
 	if err != nil {
 		return Config{}, err
@@ -102,6 +112,7 @@ func Load() (Config, error) {
 		DefaultModel:    defaultModel,
 		RequestTimeout:  requestTimeout,
 		MaxBodyBytes:    maxBodyBytes,
+		MaxInFlight:     maxInFlight,
 		Azure:           azureCfg,
 	}, nil
 }

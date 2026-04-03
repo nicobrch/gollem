@@ -1,4 +1,4 @@
-# go-llm
+# gollem
 
 Minimal, fast Go AI gateway.
 
@@ -78,6 +78,7 @@ curl -sS http://localhost:8000/v1/chat/completions \
 - `DEFAULT_MODEL` (optional): used if request does not include `model`.
 - `REQUEST_TIMEOUT_SECONDS` (optional, default `60`).
 - `MAX_BODY_BYTES` (optional, default `1048576`).
+- `MAX_INFLIGHT_REQUESTS` (optional, default `0`): max concurrent in-flight chat requests accepted by gateway. `0` disables the limit.
 
 Compatibility fallbacks:
 
@@ -126,6 +127,54 @@ For chat requests, terminal logs include request and response summaries with:
 - status code and latency
 
 Sensitive values like API keys and auth headers are not logged.
+
+## Benchmark gateway overhead
+
+You can benchmark latency/throughput overhead added by gollem compared to direct provider calls.
+
+1. Start gollem gateway:
+
+```bash
+go run .
+```
+
+2. Install benchmark dependencies:
+
+```bash
+python -m pip install -r scripts/requirements-benchmark.txt
+```
+
+3. Set benchmark env vars:
+
+```bash
+export GATEWAY_URL="http://localhost:8000/v1/chat/completions"
+export GATEWAY_API_KEY="<gateway-client-key>"
+
+export PROVIDER_URL="https://<your-account>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-10-21"
+export PROVIDER_API_KEY="<azure-key>"
+export PROVIDER_API_KEY_HEADER="api-key"
+export PROVIDER_API_KEY_PREFIX=""
+
+export BENCHMARK_MODEL="<deployment>"
+```
+
+4. Run the benchmark (LiteLLM-style load profile):
+
+```bash
+python scripts/benchmark_gateway_vs_provider.py --requests 2000 --max-concurrent 200 --runs 3
+```
+
+The script prints:
+
+- Gateway vs direct throughput delta (`req/s`)
+- Latency overhead for `mean`, `p50`, `p95`, and `p99` in milliseconds
+- Success/failure rates, status-code distribution, and top error messages
+
+Notes:
+
+- Default execution mode is sequential (gateway then direct), which gives cleaner comparison numbers.
+- For OpenAI-style direct calls, set `PROVIDER_API_KEY_HEADER="Authorization"` and `PROVIDER_API_KEY_PREFIX="Bearer"`.
+- If you see provider throttling/timeouts under load, lower `--max-concurrent` and/or set `MAX_INFLIGHT_REQUESTS` (for example `10-50`) to protect upstream.
 
 ## Security
 

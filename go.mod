@@ -1,3 +1,3 @@
-module go-llm
+module gollem
 
 go 1.22
