@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -28,11 +29,17 @@ func main() {
 		log.Fatalf("provider error: %v", err)
 	}
 
-	keyStore := gatewaykeys.NewFileStore(cfg.GatewayKeysFile)
+	keyStore, keyStoreClose, err := newKeyStoreFromConfig(cfg)
+	if err != nil {
+		log.Fatalf("key store error: %v", err)
+	}
+	if keyStoreClose != nil {
+		defer keyStoreClose()
+	}
+
 	keyManager := gatewaykeys.NewManager(keyStore)
 
 	g := gateway.New(httpclient.New(cfg.RequestTimeout), provider, keyManager, gateway.Config{
-		GatewayAPIKey:        cfg.GatewayAPIKey,
 		AdminAPIKey:          cfg.GatewayAdminKey,
 		DefaultModel:         cfg.DefaultModel,
 		AzureDeployment:      cfg.Azure.DeploymentName,
@@ -53,7 +60,10 @@ func main() {
 
 	log.Printf("gollem listening on %s", cfg.ListenAddr)
 	log.Printf("provider: %s", provider.Name())
-	log.Printf("gateway keys file: %s", cfg.GatewayKeysFile)
+	log.Printf("gateway keys backend: %s", cfg.GatewayKeysBackend)
+	if cfg.GatewayKeysBackend == "file" {
+		log.Printf("gateway keys file: %s", cfg.GatewayKeysFile)
+	}
 	if cfg.ProviderName == "azure" {
 		azureHost := cfg.Azure.UpstreamURL
 		if parsedURL, parseErr := url.Parse(cfg.Azure.UpstreamURL); parseErr == nil && parsedURL.Host != "" {
@@ -90,5 +100,24 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 		log.Printf("server stopped gracefully")
+	}
+}
+
+func newKeyStoreFromConfig(cfg appconfig.Config) (gatewaykeys.Store, func(), error) {
+	switch cfg.GatewayKeysBackend {
+	case "file":
+		return gatewaykeys.NewFileStore(cfg.GatewayKeysFile), nil, nil
+	case "postgres":
+		store, err := gatewaykeys.NewPostgresStore(cfg.GatewayKeysPostgres.DSN)
+		if err != nil {
+			return nil, nil, err
+		}
+		return store, func() {
+			if err := store.Close(); err != nil {
+				log.Printf("failed closing postgres key store: %v", err)
+			}
+		}, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported key backend: %q", cfg.GatewayKeysBackend)
 	}
 }

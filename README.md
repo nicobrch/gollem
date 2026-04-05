@@ -11,7 +11,7 @@ This version supports:
   - `POST /openai/deployments/{deployment}/chat/completions` (optional `api-version` query is accepted and ignored by the gateway)
 - OpenAI-compatible Chat Completions request format
 - Gateway-issued API key auth for your clients
-- Admin key management endpoints backed by JSON file persistence
+- Admin key management endpoints backed by file or PostgreSQL persistence
 - Forwards to Azure AI Foundry (Azure OpenAI) chat completions deployment endpoint
 - Live request/response logging in terminal with redaction-safe summaries
 
@@ -21,6 +21,7 @@ This version supports:
 
 ```bash
 export GATEWAY_ADMIN_API_KEY="gw-admin-dev-key"
+export GATEWAY_KEYS_BACKEND="file"
 export GATEWAY_KEYS_FILE="./data/gateway_keys.json"
 export AZURE_OPENAI_API_KEY="..."
 export AZURE_OPENAI_BASE_URL="https://<your-account>.openai.azure.com"
@@ -66,9 +67,9 @@ curl -sS http://localhost:8000/v1/chat/completions \
 ## Config
 
 - `GATEWAY_ADMIN_API_KEY` (required): admin key for key management endpoints.
-- `ALLOW_LEGACY_ADMIN_KEY_FALLBACK` (optional, default `false`): if `true`, allows `GATEWAY_API_KEY` to be reused as admin key when `GATEWAY_ADMIN_API_KEY` is unset (development-only compatibility mode).
-- `GATEWAY_KEYS_FILE` (optional, default `./data/gateway_keys.json`): JSON persistence file for issued gateway keys.
-- `GATEWAY_API_KEY` (optional): legacy static client key fallback. This is supported for migration, but managed keys are recommended.
+- `GATEWAY_KEYS_BACKEND` (optional, default `file`): key storage backend (`file` or `postgres`).
+- `GATEWAY_KEYS_FILE` (optional, default `./data/gateway_keys.json`): used when `GATEWAY_KEYS_BACKEND=file`.
+- `GATEWAY_KEYS_POSTGRES_DSN` (required when `GATEWAY_KEYS_BACKEND=postgres`): PostgreSQL DSN, e.g. `postgres://gollem:gollem@postgres:5432/gollem?sslmode=disable`.
 - `AZURE_OPENAI_API_KEY` (required): Azure OpenAI key.
 - `AZURE_OPENAI_BASE_URL` (required): Foundry endpoint base URL, e.g. `https://<account>.openai.azure.com`.
 - `AZURE_OPENAI_DEPLOYMENT` (required): deployment name created in Azure Foundry (for this repo, from Terraform output `openai_deployment_name`, default `gpt4o`).
@@ -82,11 +83,6 @@ curl -sS http://localhost:8000/v1/chat/completions \
 - `MAX_INFLIGHT_REQUESTS` (optional, default `0`): max concurrent in-flight chat requests accepted by gateway. `0` disables the limit.
 - `LOG_PROMPT_SUMMARIES` (optional, default `false`): include prompt previews in terminal logs.
 - `LOG_RESPONSE_SUMMARIES` (optional, default `false`): include response previews in terminal logs.
-
-Compatibility fallbacks:
-
-- If `AZURE_OPENAI_API_KEY` is missing, `OPENAI_API_KEY` is accepted as a fallback.
-- If `AZURE_OPENAI_BASE_URL` is missing, `OPENAI_BASE_URL` is accepted as a fallback.
 
 ## Key management API
 
@@ -118,6 +114,43 @@ Stored key record fields include:
 - `/healthz` is available for health checks.
 - Streaming responses are forwarded to the client.
 - The server performs graceful shutdown on `SIGINT`/`SIGTERM`.
+
+## Docker Compose (gateway + PostgreSQL)
+
+Run both services with one command:
+
+```bash
+cp .env.docker.example .env.docker
+docker compose up --build
+```
+
+Or use Make targets:
+
+```bash
+make up
+```
+
+The gateway starts on `http://localhost:8000` and stores key metadata in PostgreSQL.
+
+You can still run file-backed mode locally with `go run .` and `GATEWAY_KEYS_BACKEND=file`.
+
+Create a managed key and call the gateway in Docker mode:
+
+```bash
+curl -sS http://localhost:8000/admin/keys \
+  -H "Authorization: Bearer gw-admin-dev-key" \
+  -H "Content-Type: application/json" \
+  -d '{"metadata":{"email":"dev@example.com"}}'
+```
+
+Useful commands:
+
+```bash
+make ps
+make logs
+make logs-gateway
+make down
+```
 
 ## Live logging
 

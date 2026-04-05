@@ -69,14 +69,21 @@ func TestHandler_OpenAICompatiblePathUsesDefaultModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
 	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, nil, Config{
-		GatewayAPIKey: "gw-key",
-		DefaultModel:  "fallback-model",
-		MaxBodyBytes:  4096,
+		DefaultModel: "fallback-model",
+		MaxBodyBytes: 4096,
 	})
+	g.keys = manager
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
-	req.Header.Set("Authorization", "Bearer gw-key")
+	req.Header.Set("Authorization", "Bearer "+plainKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	rr := httptest.NewRecorder()
@@ -103,15 +110,22 @@ func TestHandler_AzureCompatiblePathUsesDeploymentAsModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
 	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, nil, Config{
-		GatewayAPIKey:   "gw-key",
 		DefaultModel:    "fallback-model",
 		AzureDeployment: "gpt-4.1-mini",
 		MaxBodyBytes:    4096,
 	})
+	g.keys = manager
 
 	req := httptest.NewRequest(http.MethodPost, "/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2024-10-21", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
-	req.Header.Set("Authorization", "Bearer gw-key")
+	req.Header.Set("Authorization", "Bearer "+plainKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	rr := httptest.NewRecorder()
@@ -126,15 +140,21 @@ func TestHandler_AzureCompatiblePathUsesDeploymentAsModel(t *testing.T) {
 }
 
 func TestHandler_AzureCompatiblePathRejectsUnknownDeployment(t *testing.T) {
-	g := New(http.DefaultClient, stubProvider{upstreamURL: "http://example.com"}, nil, Config{
-		GatewayAPIKey:   "gw-key",
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
+	g := New(http.DefaultClient, stubProvider{upstreamURL: "http://example.com"}, manager, Config{
 		DefaultModel:    "fallback-model",
 		AzureDeployment: "allowed-deployment",
 		MaxBodyBytes:    4096,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/openai/deployments/other-deployment/chat/completions?api-version=2024-10-21", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
-	req.Header.Set("Authorization", "Bearer gw-key")
+	req.Header.Set("Authorization", "Bearer "+plainKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	rr := httptest.NewRecorder()
@@ -147,13 +167,11 @@ func TestHandler_AzureCompatiblePathRejectsUnknownDeployment(t *testing.T) {
 
 func TestHandler_LegacyLLMPathIsNotServed(t *testing.T) {
 	g := New(http.DefaultClient, stubProvider{upstreamURL: "http://example.com"}, nil, Config{
-		GatewayAPIKey: "gw-key",
-		DefaultModel:  "fallback-model",
-		MaxBodyBytes:  4096,
+		DefaultModel: "fallback-model",
+		MaxBodyBytes: 4096,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/llm", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
-	req.Header.Set("Authorization", "Bearer gw-key")
 	req.Header.Set("Content-Type", "application/json")
 
 	rr := httptest.NewRecorder()
@@ -291,14 +309,21 @@ func TestHandler_MaxInFlightRejectsExcessRequests(t *testing.T) {
 	defer upstream.Close()
 
 	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, nil, Config{
-		GatewayAPIKey: "gw-key",
-		DefaultModel:  "fallback-model",
-		MaxBodyBytes:  4096,
-		MaxInFlight:   1,
+		DefaultModel: "fallback-model",
+		MaxBodyBytes: 4096,
+		MaxInFlight:  1,
 	})
 
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+	g.keys = manager
+
 	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"first"}]}`))
-	firstReq.Header.Set("Authorization", "Bearer gw-key")
+	firstReq.Header.Set("Authorization", "Bearer "+plainKey)
 	firstReq.Header.Set("Content-Type", "application/json")
 
 	firstCode := make(chan int, 1)
@@ -311,7 +336,7 @@ func TestHandler_MaxInFlightRejectsExcessRequests(t *testing.T) {
 	<-entered
 
 	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"second"}]}`))
-	secondReq.Header.Set("Authorization", "Bearer gw-key")
+	secondReq.Header.Set("Authorization", "Bearer "+plainKey)
 	secondReq.Header.Set("Content-Type", "application/json")
 
 	secondRR := httptest.NewRecorder()

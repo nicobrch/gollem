@@ -13,6 +13,7 @@ import (
 const (
 	defaultPort                 = "8000"
 	defaultProvider             = "azure"
+	defaultGatewayKeysBackend   = "file"
 	defaultAzureAPIVersion      = "2024-10-21"
 	defaultRequestTimeout       = 60 * time.Second
 	defaultMaxBodyBytes         = int64(1 << 20) // 1 MiB
@@ -22,9 +23,10 @@ const (
 
 type Config struct {
 	ListenAddr           string
-	GatewayAPIKey        string
 	GatewayAdminKey      string
+	GatewayKeysBackend   string
 	GatewayKeysFile      string
+	GatewayKeysPostgres  PostgresConfig
 	ProviderName         string
 	DefaultModel         string
 	RequestTimeout       time.Duration
@@ -33,6 +35,10 @@ type Config struct {
 	LogPromptSummaries   bool
 	LogResponseSummaries bool
 	Azure                AzureConfig
+}
+
+type PostgresConfig struct {
+	DSN string
 }
 
 type AzureConfig struct {
@@ -49,22 +55,27 @@ func Load() (Config, error) {
 	port := envOrDefault("PORT", defaultPort)
 	listenAddr := envOrDefault("LISTEN_ADDR", ":"+port)
 
-	gatewayAPIKey := strings.TrimSpace(os.Getenv("GATEWAY_API_KEY"))
 	gatewayAdminKey := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_API_KEY"))
-	allowLegacyAdminFallback, err := envBool("ALLOW_LEGACY_ADMIN_KEY_FALLBACK", false)
-	if err != nil {
-		return Config{}, err
-	}
-	if gatewayAdminKey == "" && allowLegacyAdminFallback {
-		gatewayAdminKey = gatewayAPIKey
-	}
 	if gatewayAdminKey == "" {
 		return Config{}, fmt.Errorf("GATEWAY_ADMIN_API_KEY is required")
 	}
 
-	gatewayKeysFile := strings.TrimSpace(envOrDefault("GATEWAY_KEYS_FILE", defaultGatewayKeysFile))
-	if gatewayKeysFile == "" {
-		return Config{}, fmt.Errorf("GATEWAY_KEYS_FILE cannot be empty")
+	gatewayKeysBackend := strings.ToLower(envOrDefault("GATEWAY_KEYS_BACKEND", defaultGatewayKeysBackend))
+	gatewayKeysFile := ""
+	gatewayKeysPostgres := PostgresConfig{}
+	switch gatewayKeysBackend {
+	case "file":
+		gatewayKeysFile = strings.TrimSpace(envOrDefault("GATEWAY_KEYS_FILE", defaultGatewayKeysFile))
+		if gatewayKeysFile == "" {
+			return Config{}, fmt.Errorf("GATEWAY_KEYS_FILE cannot be empty")
+		}
+	case "postgres":
+		gatewayKeysPostgres.DSN = strings.TrimSpace(os.Getenv("GATEWAY_KEYS_POSTGRES_DSN"))
+		if gatewayKeysPostgres.DSN == "" {
+			return Config{}, fmt.Errorf("GATEWAY_KEYS_POSTGRES_DSN is required when GATEWAY_KEYS_BACKEND=postgres")
+		}
+	default:
+		return Config{}, fmt.Errorf("unsupported GATEWAY_KEYS_BACKEND: %q", gatewayKeysBackend)
 	}
 
 	providerName := strings.ToLower(envOrDefault("LLM_PROVIDER", defaultProvider))
@@ -121,9 +132,10 @@ func Load() (Config, error) {
 
 	return Config{
 		ListenAddr:           listenAddr,
-		GatewayAPIKey:        gatewayAPIKey,
 		GatewayAdminKey:      gatewayAdminKey,
+		GatewayKeysBackend:   gatewayKeysBackend,
 		GatewayKeysFile:      gatewayKeysFile,
+		GatewayKeysPostgres:  gatewayKeysPostgres,
 		ProviderName:         providerName,
 		DefaultModel:         defaultModel,
 		RequestTimeout:       requestTimeout,
@@ -138,26 +150,17 @@ func Load() (Config, error) {
 func loadAzureConfig() (AzureConfig, error) {
 	azureAPIKey := strings.TrimSpace(os.Getenv("AZURE_OPENAI_API_KEY"))
 	if azureAPIKey == "" {
-		azureAPIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-	}
-	if azureAPIKey == "" {
-		return AzureConfig{}, fmt.Errorf("AZURE_OPENAI_API_KEY (or OPENAI_API_KEY fallback) is required")
+		return AzureConfig{}, fmt.Errorf("AZURE_OPENAI_API_KEY is required")
 	}
 
 	azureBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AZURE_OPENAI_BASE_URL")), "/")
-	if azureBaseURL == "" {
-		azureBaseURL = strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")), "/")
-	}
 	if azureBaseURL == "" {
 		return AzureConfig{}, fmt.Errorf("AZURE_OPENAI_BASE_URL is required")
 	}
 
 	deploymentName := strings.TrimSpace(os.Getenv("AZURE_OPENAI_DEPLOYMENT"))
 	if deploymentName == "" {
-		deploymentName = strings.TrimSpace(os.Getenv("DEFAULT_MODEL"))
-	}
-	if deploymentName == "" {
-		return AzureConfig{}, fmt.Errorf("AZURE_OPENAI_DEPLOYMENT is required (or DEFAULT_MODEL fallback)")
+		return AzureConfig{}, fmt.Errorf("AZURE_OPENAI_DEPLOYMENT is required")
 	}
 
 	apiVersion := strings.TrimSpace(os.Getenv("AZURE_OPENAI_API_VERSION"))

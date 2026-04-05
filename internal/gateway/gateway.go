@@ -27,7 +27,6 @@ const (
 )
 
 type Config struct {
-	GatewayAPIKey        string
 	AdminAPIKey          string
 	DefaultModel         string
 	AzureDeployment      string
@@ -251,10 +250,6 @@ func (g *Gateway) authenticateRequest(r *http.Request) (gatewaykeys.Principal, b
 		if ok {
 			return principal, true, nil
 		}
-	}
-
-	if g.cfg.GatewayAPIKey != "" && subtle.ConstantTimeCompare([]byte(token), []byte(g.cfg.GatewayAPIKey)) == 1 {
-		return gatewaykeys.Principal{KeyID: "legacy", Metadata: map[string]string{}}, true, nil
 	}
 
 	return gatewaykeys.Principal{}, false, nil

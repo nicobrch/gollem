@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+!.env.docker.example
+data/
+scripts/
+go-llm
+gollem
+*.out
+coverage.*
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
