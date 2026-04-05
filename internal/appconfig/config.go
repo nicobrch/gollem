@@ -21,16 +21,18 @@ const (
 )
 
 type Config struct {
-	ListenAddr      string
-	GatewayAPIKey   string
-	GatewayAdminKey string
-	GatewayKeysFile string
-	ProviderName    string
-	DefaultModel    string
-	RequestTimeout  time.Duration
-	MaxBodyBytes    int64
-	MaxInFlight     int
-	Azure           AzureConfig
+	ListenAddr           string
+	GatewayAPIKey        string
+	GatewayAdminKey      string
+	GatewayKeysFile      string
+	ProviderName         string
+	DefaultModel         string
+	RequestTimeout       time.Duration
+	MaxBodyBytes         int64
+	MaxInFlight          int
+	LogPromptSummaries   bool
+	LogResponseSummaries bool
+	Azure                AzureConfig
 }
 
 type AzureConfig struct {
@@ -49,11 +51,15 @@ func Load() (Config, error) {
 
 	gatewayAPIKey := strings.TrimSpace(os.Getenv("GATEWAY_API_KEY"))
 	gatewayAdminKey := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_API_KEY"))
-	if gatewayAdminKey == "" {
+	allowLegacyAdminFallback, err := envBool("ALLOW_LEGACY_ADMIN_KEY_FALLBACK", false)
+	if err != nil {
+		return Config{}, err
+	}
+	if gatewayAdminKey == "" && allowLegacyAdminFallback {
 		gatewayAdminKey = gatewayAPIKey
 	}
 	if gatewayAdminKey == "" {
-		return Config{}, fmt.Errorf("GATEWAY_ADMIN_API_KEY is required (or GATEWAY_API_KEY fallback)")
+		return Config{}, fmt.Errorf("GATEWAY_ADMIN_API_KEY is required")
 	}
 
 	gatewayKeysFile := strings.TrimSpace(envOrDefault("GATEWAY_KEYS_FILE", defaultGatewayKeysFile))
@@ -93,6 +99,16 @@ func Load() (Config, error) {
 		maxInFlight = limit
 	}
 
+	logPromptSummaries, err := envBool("LOG_PROMPT_SUMMARIES", false)
+	if err != nil {
+		return Config{}, err
+	}
+
+	logResponseSummaries, err := envBool("LOG_RESPONSE_SUMMARIES", false)
+	if err != nil {
+		return Config{}, err
+	}
+
 	azureCfg, err := loadAzureConfig()
 	if err != nil {
 		return Config{}, err
@@ -104,16 +120,18 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		ListenAddr:      listenAddr,
-		GatewayAPIKey:   gatewayAPIKey,
-		GatewayAdminKey: gatewayAdminKey,
-		GatewayKeysFile: gatewayKeysFile,
-		ProviderName:    providerName,
-		DefaultModel:    defaultModel,
-		RequestTimeout:  requestTimeout,
-		MaxBodyBytes:    maxBodyBytes,
-		MaxInFlight:     maxInFlight,
-		Azure:           azureCfg,
+		ListenAddr:           listenAddr,
+		GatewayAPIKey:        gatewayAPIKey,
+		GatewayAdminKey:      gatewayAdminKey,
+		GatewayKeysFile:      gatewayKeysFile,
+		ProviderName:         providerName,
+		DefaultModel:         defaultModel,
+		RequestTimeout:       requestTimeout,
+		MaxBodyBytes:         maxBodyBytes,
+		MaxInFlight:          maxInFlight,
+		LogPromptSummaries:   logPromptSummaries,
+		LogResponseSummaries: logResponseSummaries,
+		Azure:                azureCfg,
 	}, nil
 }
 
@@ -182,6 +200,20 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envBool(key string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean (true/false)", key)
+	}
+
+	return parsed, nil
 }
 
 func loadDotEnvFile(path string) error {

@@ -4,6 +4,7 @@
 
 # Go build artifacts
 gollem
+go-llm
 *.exe
 *.dll
 *.so

@@ -27,11 +27,14 @@ const (
 )
 
 type Config struct {
-	GatewayAPIKey string
-	AdminAPIKey   string
-	DefaultModel  string
-	MaxBodyBytes  int64
-	MaxInFlight   int
+	GatewayAPIKey        string
+	AdminAPIKey          string
+	DefaultModel         string
+	AzureDeployment      string
+	MaxBodyBytes         int64
+	MaxInFlight          int
+	LogPromptSummaries   bool
+	LogResponseSummaries bool
 }
 
 type Gateway struct {
@@ -87,6 +90,10 @@ func (g *Gateway) azureChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 	deploymentName, ok := deploymentNameFromPath(r.URL.Path)
 	if !ok {
 		writeOpenAIError(w, http.StatusNotFound, "unsupported path", "not_found")
+		return
+	}
+	if g.cfg.AzureDeployment != "" && deploymentName != g.cfg.AzureDeployment {
+		writeOpenAIError(w, http.StatusBadRequest, "unsupported deployment for this gateway", "invalid_deployment")
 		return
 	}
 
@@ -145,7 +152,7 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	requestSummary, targetModel := summarizeRequestPayload(normalizedBody)
+	requestSummary, targetModel := summarizeRequestPayload(normalizedBody, g.cfg.LogPromptSummaries)
 
 	acceptHeader := strings.TrimSpace(r.Header.Get("Accept"))
 	proxyReq, err := g.provider.NewChatCompletionsRequest(r.Context(), normalizedBody, acceptHeader, defaultUserAgent)
@@ -167,13 +174,26 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	responseCapture := newLimitedBuffer(2048)
-	if err := streamCopy(w, io.TeeReader(resp.Body, responseCapture)); err != nil {
-		log.Printf("response streaming failed: %v", err)
+	var responseSummary string
+	reader := io.Reader(resp.Body)
+	var responseCapture *limitedBuffer
+	if g.cfg.LogResponseSummaries {
+		responseCapture = newLimitedBuffer(2048)
+		reader = io.TeeReader(resp.Body, responseCapture)
 	}
 
-	responseSummary := summarizeResponsePayload(responseCapture.Bytes())
-	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, resp.StatusCode, elapsedMillis(start))
+	if err := streamCopy(w, reader); err != nil {
+		log.Printf("response streaming failed: %v", err)
+	}
+	if g.cfg.LogResponseSummaries {
+		responseSummary = summarizeResponsePayload(responseCapture.Bytes())
+	}
+
+	if g.cfg.LogResponseSummaries {
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, resp.StatusCode, elapsedMillis(start))
+		return
+	}
+	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, resp.StatusCode, elapsedMillis(start))
 }
 
 func (g *Gateway) tryAcquireInFlightSlot() (func(), bool) {
@@ -466,10 +486,13 @@ func ownerHint(metadata map[string]string) string {
 	return "custom"
 }
 
-func summarizeRequestPayload(body []byte) (string, string) {
+func summarizeRequestPayload(body []byte, includePrompt bool) (string, string) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return truncateForLog(string(body), 180), ""
+		if includePrompt {
+			return truncateForLog(string(body), 180), ""
+		}
+		return "invalid_json", ""
 	}
 
 	model := strings.TrimSpace(fmt.Sprint(payload["model"]))
@@ -479,6 +502,10 @@ func summarizeRequestPayload(body []byte) (string, string) {
 
 	messagesAny, _ := payload["messages"].([]any)
 	messageCount := len(messagesAny)
+	if !includePrompt {
+		return fmt.Sprintf("messages=%d", messageCount), model
+	}
+
 	promptPreview := ""
 	for i := len(messagesAny) - 1; i >= 0; i-- {
 		messageMap, ok := messagesAny[i].(map[string]any)

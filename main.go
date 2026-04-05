@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"gollem/internal/appconfig"
@@ -28,11 +32,14 @@ func main() {
 	keyManager := gatewaykeys.NewManager(keyStore)
 
 	g := gateway.New(httpclient.New(cfg.RequestTimeout), provider, keyManager, gateway.Config{
-		GatewayAPIKey: cfg.GatewayAPIKey,
-		AdminAPIKey:   cfg.GatewayAdminKey,
-		DefaultModel:  cfg.DefaultModel,
-		MaxBodyBytes:  cfg.MaxBodyBytes,
-		MaxInFlight:   cfg.MaxInFlight,
+		GatewayAPIKey:        cfg.GatewayAPIKey,
+		AdminAPIKey:          cfg.GatewayAdminKey,
+		DefaultModel:         cfg.DefaultModel,
+		AzureDeployment:      cfg.Azure.DeploymentName,
+		MaxBodyBytes:         cfg.MaxBodyBytes,
+		MaxInFlight:          cfg.MaxInFlight,
+		LogPromptSummaries:   cfg.LogPromptSummaries,
+		LogResponseSummaries: cfg.LogResponseSummaries,
 	})
 
 	server := &http.Server{
@@ -55,7 +62,33 @@ func main() {
 		log.Printf("azure upstream host: %s", azureHost)
 	}
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	case <-shutdownCtx.Done():
+		log.Printf("shutdown signal received")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Fatalf("server shutdown error: %v", err)
+		}
+		if err := <-serverErr; err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+		log.Printf("server stopped gracefully")
 	}
 }

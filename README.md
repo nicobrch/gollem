@@ -65,7 +65,8 @@ curl -sS http://localhost:8000/v1/chat/completions \
 
 ## Config
 
-- `GATEWAY_ADMIN_API_KEY` (required unless `GATEWAY_API_KEY` is set): admin key for key management endpoints.
+- `GATEWAY_ADMIN_API_KEY` (required): admin key for key management endpoints.
+- `ALLOW_LEGACY_ADMIN_KEY_FALLBACK` (optional, default `false`): if `true`, allows `GATEWAY_API_KEY` to be reused as admin key when `GATEWAY_ADMIN_API_KEY` is unset (development-only compatibility mode).
 - `GATEWAY_KEYS_FILE` (optional, default `./data/gateway_keys.json`): JSON persistence file for issued gateway keys.
 - `GATEWAY_API_KEY` (optional): legacy static client key fallback. This is supported for migration, but managed keys are recommended.
 - `AZURE_OPENAI_API_KEY` (required): Azure OpenAI key.
@@ -79,6 +80,8 @@ curl -sS http://localhost:8000/v1/chat/completions \
 - `REQUEST_TIMEOUT_SECONDS` (optional, default `60`).
 - `MAX_BODY_BYTES` (optional, default `1048576`).
 - `MAX_INFLIGHT_REQUESTS` (optional, default `0`): max concurrent in-flight chat requests accepted by gateway. `0` disables the limit.
+- `LOG_PROMPT_SUMMARIES` (optional, default `false`): include prompt previews in terminal logs.
+- `LOG_RESPONSE_SUMMARIES` (optional, default `false`): include response previews in terminal logs.
 
 Compatibility fallbacks:
 
@@ -111,20 +114,25 @@ Stored key record fields include:
 - Client auth supports `Authorization: Bearer <gateway-key>` and `X-API-Key`.
 - Gateway validates managed keys by hash, checks `status`, and enforces optional `expires_at`.
 - If `model` is missing and you call `/openai/deployments/{deployment}/chat/completions`, the gateway uses `{deployment}` as `model`.
+- Azure-compatible deployment paths are restricted to the configured deployment (`AZURE_OPENAI_DEPLOYMENT`) to avoid ambiguous routing.
 - `/healthz` is available for health checks.
 - Streaming responses are forwarded to the client.
+- The server performs graceful shutdown on `SIGINT`/`SIGTERM`.
 
 ## Live logging
 
-For chat requests, terminal logs include request and response summaries with:
+For chat requests, terminal logs always include:
 
 - timestamp
 - request id
 - key id and owner hint from metadata (if available)
 - route, provider, and model
-- request prompt summary
-- response summary
 - status code and latency
+
+Optional logging controls:
+
+- Set `LOG_PROMPT_SUMMARIES=true` to include request prompt summary.
+- Set `LOG_RESPONSE_SUMMARIES=true` to include response summary.
 
 Sensitive values like API keys and auth headers are not logged.
 

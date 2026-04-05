@@ -104,9 +104,10 @@ func TestHandler_AzureCompatiblePathUsesDeploymentAsModel(t *testing.T) {
 	defer upstream.Close()
 
 	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, nil, Config{
-		GatewayAPIKey: "gw-key",
-		DefaultModel:  "fallback-model",
-		MaxBodyBytes:  4096,
+		GatewayAPIKey:   "gw-key",
+		DefaultModel:    "fallback-model",
+		AzureDeployment: "gpt-4.1-mini",
+		MaxBodyBytes:    4096,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2024-10-21", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
@@ -121,6 +122,26 @@ func TestHandler_AzureCompatiblePathUsesDeploymentAsModel(t *testing.T) {
 	}
 	if captured["model"] != "gpt-4.1-mini" {
 		t.Fatalf("expected model %q, got %#v", "gpt-4.1-mini", captured["model"])
+	}
+}
+
+func TestHandler_AzureCompatiblePathRejectsUnknownDeployment(t *testing.T) {
+	g := New(http.DefaultClient, stubProvider{upstreamURL: "http://example.com"}, nil, Config{
+		GatewayAPIKey:   "gw-key",
+		DefaultModel:    "fallback-model",
+		AzureDeployment: "allowed-deployment",
+		MaxBodyBytes:    4096,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/openai/deployments/other-deployment/chat/completions?api-version=2024-10-21", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer gw-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	g.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
 	}
 }
 
