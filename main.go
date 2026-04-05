@@ -16,6 +16,7 @@ import (
 	"gollem/internal/gatewaykeys"
 	"gollem/internal/httpclient"
 	"gollem/internal/providers"
+	"gollem/internal/semanticcache"
 )
 
 func main() {
@@ -38,8 +39,21 @@ func main() {
 	}
 
 	keyManager := gatewaykeys.NewManager(keyStore)
+	httpClient := httpclient.New(cfg.RequestTimeout)
 
-	g := gateway.New(httpclient.New(cfg.RequestTimeout), provider, keyManager, gateway.Config{
+	semCache, err := semanticcache.New(cfg.SemanticCache, cfg.Azure, httpClient)
+	if err != nil {
+		log.Fatalf("semantic cache error: %v", err)
+	}
+	if semCache != nil {
+		defer func() {
+			if closeErr := semCache.Close(); closeErr != nil {
+				log.Printf("failed closing semantic cache: %v", closeErr)
+			}
+		}()
+	}
+
+	g := gateway.New(httpClient, provider, keyManager, gateway.Config{
 		AdminAPIKey:          cfg.GatewayAdminKey,
 		DefaultModel:         cfg.DefaultModel,
 		AzureDeployment:      cfg.Azure.DeploymentName,
@@ -47,6 +61,7 @@ func main() {
 		MaxInFlight:          cfg.MaxInFlight,
 		LogPromptSummaries:   cfg.LogPromptSummaries,
 		LogResponseSummaries: cfg.LogResponseSummaries,
+		SemanticCache:        semCache,
 	})
 
 	server := &http.Server{
@@ -70,6 +85,11 @@ func main() {
 			azureHost = parsedURL.Host
 		}
 		log.Printf("azure upstream host: %s", azureHost)
+	}
+	if cfg.SemanticCache.Enabled {
+		log.Printf("semantic cache: enabled addr=%s", cfg.SemanticCache.RedisAddr)
+	} else {
+		log.Printf("semantic cache: disabled")
 	}
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -15,6 +15,12 @@ const (
 	defaultProvider             = "azure"
 	defaultGatewayKeysBackend   = "file"
 	defaultAzureAPIVersion      = "2024-10-21"
+	defaultSemanticCacheRedis   = "localhost:6379"
+	defaultSemanticCacheTTL     = 24 * time.Hour
+	defaultSemanticThreshold    = 0.92
+	defaultSemanticCandidates   = 50
+	defaultSemanticMaxEntries   = 200
+	defaultSemanticResponseSize = int64(1 << 20) // 1 MiB
 	defaultRequestTimeout       = 60 * time.Second
 	defaultMaxBodyBytes         = int64(1 << 20) // 1 MiB
 	defaultGatewayKeysFile      = "./data/gateway_keys.json"
@@ -35,6 +41,7 @@ type Config struct {
 	LogPromptSummaries   bool
 	LogResponseSummaries bool
 	Azure                AzureConfig
+	SemanticCache        SemanticCacheConfig
 }
 
 type PostgresConfig struct {
@@ -43,8 +50,23 @@ type PostgresConfig struct {
 
 type AzureConfig struct {
 	APIKey         string
+	BaseURL        string
+	APIVersion     string
 	UpstreamURL    string
 	DeploymentName string
+}
+
+type SemanticCacheConfig struct {
+	Enabled                   bool
+	RedisAddr                 string
+	RedisPassword             string
+	RedisDB                   int
+	TTL                       time.Duration
+	SimilarityThreshold       float64
+	MaxCandidates             int
+	MaxEntriesPerScope        int
+	MaxResponseBytes          int64
+	AzureEmbeddingsDeployment string
 }
 
 func Load() (Config, error) {
@@ -125,6 +147,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	semanticCacheCfg, err := loadSemanticCacheConfig()
+	if err != nil {
+		return Config{}, err
+	}
+
 	defaultModel := strings.TrimSpace(os.Getenv("DEFAULT_MODEL"))
 	if defaultModel == "" {
 		defaultModel = azureCfg.DeploymentName
@@ -144,7 +171,88 @@ func Load() (Config, error) {
 		LogPromptSummaries:   logPromptSummaries,
 		LogResponseSummaries: logResponseSummaries,
 		Azure:                azureCfg,
+		SemanticCache:        semanticCacheCfg,
 	}, nil
+}
+
+func loadSemanticCacheConfig() (SemanticCacheConfig, error) {
+	enabled, err := envBool("SEMANTIC_CACHE_ENABLED", false)
+	if err != nil {
+		return SemanticCacheConfig{}, err
+	}
+
+	cfg := SemanticCacheConfig{Enabled: enabled}
+	if !enabled {
+		return cfg, nil
+	}
+
+	cfg.RedisAddr = strings.TrimSpace(envOrDefault("SEMANTIC_CACHE_REDIS_ADDR", defaultSemanticCacheRedis))
+	if cfg.RedisAddr == "" {
+		return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_REDIS_ADDR cannot be empty")
+	}
+
+	cfg.RedisPassword = os.Getenv("SEMANTIC_CACHE_REDIS_PASSWORD")
+
+	cfg.RedisDB = 0
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_REDIS_DB")); v != "" {
+		parsed, parseErr := strconv.Atoi(v)
+		if parseErr != nil || parsed < 0 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_REDIS_DB must be a non-negative integer")
+		}
+		cfg.RedisDB = parsed
+	}
+
+	cfg.TTL = defaultSemanticCacheTTL
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_TTL_SECONDS")); v != "" {
+		seconds, parseErr := strconv.Atoi(v)
+		if parseErr != nil || seconds <= 0 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_TTL_SECONDS must be a positive integer")
+		}
+		cfg.TTL = time.Duration(seconds) * time.Second
+	}
+
+	cfg.SimilarityThreshold = defaultSemanticThreshold
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD")); v != "" {
+		threshold, parseErr := strconv.ParseFloat(v, 64)
+		if parseErr != nil || threshold <= 0 || threshold > 1 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_SIMILARITY_THRESHOLD must be a number in (0, 1]")
+		}
+		cfg.SimilarityThreshold = threshold
+	}
+
+	cfg.MaxCandidates = defaultSemanticCandidates
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_MAX_CANDIDATES")); v != "" {
+		maxCandidates, parseErr := strconv.Atoi(v)
+		if parseErr != nil || maxCandidates <= 0 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_MAX_CANDIDATES must be a positive integer")
+		}
+		cfg.MaxCandidates = maxCandidates
+	}
+
+	cfg.MaxEntriesPerScope = defaultSemanticMaxEntries
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_MAX_ENTRIES_PER_SCOPE")); v != "" {
+		maxEntries, parseErr := strconv.Atoi(v)
+		if parseErr != nil || maxEntries <= 0 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_MAX_ENTRIES_PER_SCOPE must be a positive integer")
+		}
+		cfg.MaxEntriesPerScope = maxEntries
+	}
+
+	cfg.MaxResponseBytes = defaultSemanticResponseSize
+	if v := strings.TrimSpace(os.Getenv("SEMANTIC_CACHE_MAX_RESPONSE_BYTES")); v != "" {
+		maxBytes, parseErr := strconv.ParseInt(v, 10, 64)
+		if parseErr != nil || maxBytes <= 0 {
+			return SemanticCacheConfig{}, fmt.Errorf("SEMANTIC_CACHE_MAX_RESPONSE_BYTES must be a positive integer")
+		}
+		cfg.MaxResponseBytes = maxBytes
+	}
+
+	cfg.AzureEmbeddingsDeployment = strings.TrimSpace(os.Getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT"))
+	if cfg.AzureEmbeddingsDeployment == "" {
+		return SemanticCacheConfig{}, fmt.Errorf("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT is required when SEMANTIC_CACHE_ENABLED=true")
+	}
+
+	return cfg, nil
 }
 
 func loadAzureConfig() (AzureConfig, error) {
@@ -178,6 +286,8 @@ func loadAzureConfig() (AzureConfig, error) {
 
 	return AzureConfig{
 		APIKey:         azureAPIKey,
+		BaseURL:        azureBaseURL,
+		APIVersion:     apiVersion,
 		UpstreamURL:    upstreamURL,
 		DeploymentName: deploymentName,
 	}, nil

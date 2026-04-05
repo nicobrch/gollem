@@ -7,13 +7,48 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gollem/internal/gatewaykeys"
+	"gollem/internal/semanticcache"
 )
 
 type stubProvider struct {
 	upstreamURL string
+}
+
+type stubSemanticCache struct {
+	lookupFn         func(ctx context.Context, keyID string, requestBody []byte) ([]byte, *semanticcache.PreparedLookup, error)
+	storeFn          func(ctx context.Context, prepared *semanticcache.PreparedLookup, responseBody []byte, statusCode int, contentType string) error
+	maxResponseBytes int64
+	lookupCalls      int
+	storeCalls       int
+	lookupKeyIDs     []string
+}
+
+func (s *stubSemanticCache) Lookup(ctx context.Context, keyID string, requestBody []byte) ([]byte, *semanticcache.PreparedLookup, error) {
+	s.lookupCalls++
+	s.lookupKeyIDs = append(s.lookupKeyIDs, keyID)
+	if s.lookupFn == nil {
+		return nil, nil, nil
+	}
+	return s.lookupFn(ctx, keyID, requestBody)
+}
+
+func (s *stubSemanticCache) StorePrepared(ctx context.Context, prepared *semanticcache.PreparedLookup, responseBody []byte, statusCode int, contentType string) error {
+	s.storeCalls++
+	if s.storeFn == nil {
+		return nil
+	}
+	return s.storeFn(ctx, prepared, responseBody, statusCode, contentType)
+}
+
+func (s *stubSemanticCache) MaxResponseBytes() int64 {
+	if s.maxResponseBytes > 0 {
+		return s.maxResponseBytes
+	}
+	return 1 << 20
 }
 
 func (p stubProvider) Name() string {
@@ -350,5 +385,161 @@ func TestHandler_MaxInFlightRejectsExcessRequests(t *testing.T) {
 
 	if got := <-firstCode; got != http.StatusOK {
 		t.Fatalf("expected first request status %d, got %d", http.StatusOK, got)
+	}
+}
+
+func TestHandler_SemanticCacheHitBypassesUpstream(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"upstream"}`))
+	}))
+	defer upstream.Close()
+
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
+	cache := &stubSemanticCache{
+		lookupFn: func(_ context.Context, _ string, _ []byte) ([]byte, *semanticcache.PreparedLookup, error) {
+			return []byte(`{"id":"cached"}`), &semanticcache.PreparedLookup{}, nil
+		},
+	}
+
+	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, manager, Config{
+		DefaultModel:  "fallback-model",
+		MaxBodyBytes:  4096,
+		SemanticCache: cache,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer "+plainKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	g.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if rr.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("expected X-Cache HIT, got %q", rr.Header().Get("X-Cache"))
+	}
+	if strings.TrimSpace(rr.Body.String()) != `{"id":"cached"}` {
+		t.Fatalf("unexpected cached response body: %s", rr.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("expected upstream to be bypassed, got %d calls", upstreamCalls)
+	}
+}
+
+func TestHandler_SemanticCacheMissStoresResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"upstream"}`))
+	}))
+	defer upstream.Close()
+
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	_, plainKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
+	stored := false
+	cache := &stubSemanticCache{
+		lookupFn: func(_ context.Context, _ string, _ []byte) ([]byte, *semanticcache.PreparedLookup, error) {
+			return nil, &semanticcache.PreparedLookup{ScopeKey: "scope", QueryEmbedding: []float64{1, 0}}, nil
+		},
+		storeFn: func(_ context.Context, prepared *semanticcache.PreparedLookup, responseBody []byte, statusCode int, contentType string) error {
+			stored = prepared != nil && statusCode == http.StatusOK && strings.Contains(contentType, "application/json") && strings.TrimSpace(string(responseBody)) == `{"id":"upstream"}`
+			return nil
+		},
+	}
+
+	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, manager, Config{
+		DefaultModel:  "fallback-model",
+		MaxBodyBytes:  4096,
+		SemanticCache: cache,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer "+plainKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	g.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if rr.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("expected X-Cache MISS, got %q", rr.Header().Get("X-Cache"))
+	}
+	if !stored {
+		t.Fatalf("expected semantic cache store call with upstream response")
+	}
+}
+
+func TestHandler_SemanticCacheReceivesPerKeyIdentity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"upstream"}`))
+	}))
+	defer upstream.Close()
+
+	store := gatewaykeys.NewFileStore(filepath.Join(t.TempDir(), "gateway_keys.json"))
+	manager := gatewaykeys.NewManager(store)
+	firstRecord, firstKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create first key: %v", err)
+	}
+	secondRecord, secondKey, err := manager.Create(gatewaykeys.CreateInput{})
+	if err != nil {
+		t.Fatalf("failed to create second key: %v", err)
+	}
+
+	cache := &stubSemanticCache{
+		lookupFn: func(_ context.Context, _ string, _ []byte) ([]byte, *semanticcache.PreparedLookup, error) {
+			return nil, nil, nil
+		},
+	}
+
+	g := New(http.DefaultClient, stubProvider{upstreamURL: upstream.URL}, manager, Config{
+		DefaultModel:  "fallback-model",
+		MaxBodyBytes:  4096,
+		SemanticCache: cache,
+	})
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer "+firstKey)
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstRR := httptest.NewRecorder()
+	g.Handler().ServeHTTP(firstRR, firstReq)
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}]}`))
+	secondReq.Header.Set("Authorization", "Bearer "+secondKey)
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondRR := httptest.NewRecorder()
+	g.Handler().ServeHTTP(secondRR, secondReq)
+
+	if firstRR.Code != http.StatusOK || secondRR.Code != http.StatusOK {
+		t.Fatalf("expected both requests to succeed, got %d and %d", firstRR.Code, secondRR.Code)
+	}
+	if len(cache.lookupKeyIDs) != 2 {
+		t.Fatalf("expected two cache lookups, got %d", len(cache.lookupKeyIDs))
+	}
+	if cache.lookupKeyIDs[0] != firstRecord.ID {
+		t.Fatalf("expected first lookup key id %q, got %q", firstRecord.ID, cache.lookupKeyIDs[0])
+	}
+	if cache.lookupKeyIDs[1] != secondRecord.ID {
+		t.Fatalf("expected second lookup key id %q, got %q", secondRecord.ID, cache.lookupKeyIDs[1])
 	}
 }

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 
 	"gollem/internal/gatewaykeys"
 	"gollem/internal/providers"
+	"gollem/internal/semanticcache"
 )
 
 const defaultUserAgent = "gollem/0.1"
@@ -34,6 +36,13 @@ type Config struct {
 	MaxInFlight          int
 	LogPromptSummaries   bool
 	LogResponseSummaries bool
+	SemanticCache        SemanticCache
+}
+
+type SemanticCache interface {
+	Lookup(ctx context.Context, keyID string, requestBody []byte) ([]byte, *semanticcache.PreparedLookup, error)
+	StorePrepared(ctx context.Context, prepared *semanticcache.PreparedLookup, responseBody []byte, statusCode int, contentType string) error
+	MaxResponseBytes() int64
 }
 
 type Gateway struct {
@@ -153,6 +162,23 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 
 	requestSummary, targetModel := summarizeRequestPayload(normalizedBody, g.cfg.LogPromptSummaries)
 
+	cachedResponse, preparedLookup, err := g.semanticCacheLookup(r.Context(), principal.KeyID, normalizedBody)
+	if err != nil {
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q status=%d latency_ms=%d error=%q", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, http.StatusInternalServerError, elapsedMillis(start), "semantic cache lookup failed")
+	}
+	if len(cachedResponse) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cachedResponse)
+		if g.cfg.LogResponseSummaries {
+			log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q cache=%s status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, summarizeResponsePayload(cachedResponse), "HIT", http.StatusOK, elapsedMillis(start))
+			return
+		}
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q cache=%s status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, "HIT", http.StatusOK, elapsedMillis(start))
+		return
+	}
+
 	acceptHeader := strings.TrimSpace(r.Header.Get("Accept"))
 	proxyReq, err := g.provider.NewChatCompletionsRequest(r.Context(), normalizedBody, acceptHeader, defaultUserAgent)
 	if err != nil {
@@ -170,13 +196,27 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	}
 	defer resp.Body.Close()
 
+	cacheHeaderValue := "BYPASS"
+	if preparedLookup != nil {
+		cacheHeaderValue = "MISS"
+	}
+
 	copyResponseHeaders(w.Header(), resp.Header)
+	w.Header().Set("X-Cache", cacheHeaderValue)
 	w.WriteHeader(resp.StatusCode)
 
 	var responseSummary string
 	reader := io.Reader(resp.Body)
 	var responseCapture *limitedBuffer
-	if g.cfg.LogResponseSummaries {
+	cacheLimit := g.semanticCacheMaxResponseBytes()
+	if cacheLimit > 0 && (preparedLookup != nil || g.cfg.LogResponseSummaries) {
+		captureSize := cacheLimit
+		if captureSize > 2<<20 {
+			captureSize = 2 << 20
+		}
+		responseCapture = newLimitedBuffer(int(captureSize))
+		reader = io.TeeReader(resp.Body, responseCapture)
+	} else if g.cfg.LogResponseSummaries {
 		responseCapture = newLimitedBuffer(2048)
 		reader = io.TeeReader(resp.Body, responseCapture)
 	}
@@ -184,15 +224,35 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	if err := streamCopy(w, reader); err != nil {
 		log.Printf("response streaming failed: %v", err)
 	}
-	if g.cfg.LogResponseSummaries {
+	if preparedLookup != nil && responseCapture != nil {
+		if cacheErr := g.cfg.SemanticCache.StorePrepared(r.Context(), preparedLookup, responseCapture.Bytes(), resp.StatusCode, resp.Header.Get("Content-Type")); cacheErr != nil {
+			log.Printf("semantic cache store failed request_id=%s error=%q", requestID, cacheErr.Error())
+		}
+	}
+
+	if g.cfg.LogResponseSummaries && responseCapture != nil {
 		responseSummary = summarizeResponsePayload(responseCapture.Bytes())
 	}
 
 	if g.cfg.LogResponseSummaries {
-		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, resp.StatusCode, elapsedMillis(start))
+		log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q response=%q cache=%s status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, responseSummary, cacheHeaderValue, resp.StatusCode, elapsedMillis(start))
 		return
 	}
-	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, resp.StatusCode, elapsedMillis(start))
+	log.Printf("gateway request_id=%s route=%s key_id=%s owner=%s provider=%s model=%s request=%q cache=%s status=%d latency_ms=%d", requestID, r.URL.Path, principal.KeyID, ownerHint(principal.Metadata), g.provider.Name(), targetModel, requestSummary, cacheHeaderValue, resp.StatusCode, elapsedMillis(start))
+}
+
+func (g *Gateway) semanticCacheLookup(ctx context.Context, keyID string, normalizedBody []byte) ([]byte, *semanticcache.PreparedLookup, error) {
+	if g.cfg.SemanticCache == nil {
+		return nil, nil, nil
+	}
+	return g.cfg.SemanticCache.Lookup(ctx, keyID, normalizedBody)
+}
+
+func (g *Gateway) semanticCacheMaxResponseBytes() int64 {
+	if g.cfg.SemanticCache == nil {
+		return 0
+	}
+	return g.cfg.SemanticCache.MaxResponseBytes()
 }
 
 func (g *Gateway) tryAcquireInFlightSlot() (func(), bool) {

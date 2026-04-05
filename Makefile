@@ -7,7 +7,7 @@ ENV_EXAMPLE ?= .env.docker.example
 help:
 	@printf "Available targets:\n"
 	@printf "  make env-docker   Create %s from %s if missing\n" "$(ENV_FILE)" "$(ENV_EXAMPLE)"
-	@printf "  make up           Build and start gateway + postgres\n"
+	@printf "  make up           Build and start gateway + postgres + redis\n"
 	@printf "  make down         Stop and remove compose services\n"
 	@printf "  make logs         Tail logs for all services\n"
 	@printf "  make logs-gateway Tail logs for gateway service\n"

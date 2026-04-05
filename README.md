@@ -13,6 +13,7 @@ This version supports:
 - Gateway-issued API key auth for your clients
 - Admin key management endpoints backed by file or PostgreSQL persistence
 - Forwards to Azure AI Foundry (Azure OpenAI) chat completions deployment endpoint
+- Optional semantic cache with Redis (per-key isolation) using Azure embeddings
 - Live request/response logging in terminal with redaction-safe summaries
 
 ## Quick start
@@ -83,6 +84,16 @@ curl -sS http://localhost:8000/v1/chat/completions \
 - `MAX_INFLIGHT_REQUESTS` (optional, default `0`): max concurrent in-flight chat requests accepted by gateway. `0` disables the limit.
 - `LOG_PROMPT_SUMMARIES` (optional, default `false`): include prompt previews in terminal logs.
 - `LOG_RESPONSE_SUMMARIES` (optional, default `false`): include response previews in terminal logs.
+- `SEMANTIC_CACHE_ENABLED` (optional, default `false`): enable semantic cache for non-stream chat requests.
+- `SEMANTIC_CACHE_REDIS_ADDR` (optional, default `localhost:6379`): Redis address.
+- `SEMANTIC_CACHE_REDIS_PASSWORD` (optional): Redis password.
+- `SEMANTIC_CACHE_REDIS_DB` (optional, default `0`): Redis database index.
+- `SEMANTIC_CACHE_TTL_SECONDS` (optional, default `86400`): cache entry TTL in seconds.
+- `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` (optional, default `0.92`): minimum cosine similarity to treat as cache hit.
+- `SEMANTIC_CACHE_MAX_CANDIDATES` (optional, default `50`): number of recent candidates scored per scope.
+- `SEMANTIC_CACHE_MAX_ENTRIES_PER_SCOPE` (optional, default `200`): max retained entries per scope before trimming.
+- `SEMANTIC_CACHE_MAX_RESPONSE_BYTES` (optional, default `1048576`): max response size allowed for caching.
+- `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT` (required when semantic cache is enabled): Azure embeddings deployment name.
 
 ## Key management API
 
@@ -113,9 +124,11 @@ Stored key record fields include:
 - Azure-compatible deployment paths are restricted to the configured deployment (`AZURE_OPENAI_DEPLOYMENT`) to avoid ambiguous routing.
 - `/healthz` is available for health checks.
 - Streaming responses are forwarded to the client.
+- Semantic cache bypasses `stream=true` requests.
+- Responses include `X-Cache: HIT`, `X-Cache: MISS`, or `X-Cache: BYPASS`.
 - The server performs graceful shutdown on `SIGINT`/`SIGTERM`.
 
-## Docker Compose (gateway + PostgreSQL)
+## Docker Compose (gateway + PostgreSQL + Redis)
 
 Run both services with one command:
 
@@ -130,7 +143,15 @@ Or use Make targets:
 make up
 ```
 
-The gateway starts on `http://localhost:8000` and stores key metadata in PostgreSQL.
+The gateway starts on `http://localhost:8000` and stores key metadata in PostgreSQL. Redis is available for semantic cache.
+
+To enable semantic cache in Docker mode, set:
+
+```bash
+SEMANTIC_CACHE_ENABLED=true
+SEMANTIC_CACHE_REDIS_ADDR=redis:6379
+AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT=<your-embeddings-deployment>
+```
 
 You can still run file-backed mode locally with `go run .` and `GATEWAY_KEYS_BACKEND=file`.
 
